@@ -216,6 +216,21 @@ function toCompactItems(articles = []) {
   });
 }
 
+
+
+function cleanPhrases(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map(s => (s || "").toString().trim())
+    .filter(Boolean)
+    .filter((s, i, a) => s.length >= 3 && a.indexOf(s) === i);
+}
+function includesAnyKeywordInTitle(title = "", phrases = []) {
+  if (!title || !phrases?.length) return false;
+  const t = title.toLowerCase();
+  return phrases.some(p => t.includes(p.toLowerCase()));
+}
+
 export default function NewsHUD() {
   // const [articles, setArticles] = useState([]);
 const [allArticles, setAllArticles] = useState([]);
@@ -238,10 +253,12 @@ const articles = React.useMemo(() => {
 
  const API_BASE = "http://localhost:8000";
 
-async function runForecast({ articles, horizonDays = 14 }) {
+async function runForecast({ articles, horizonDays = 14 ,limit }) {
   const payload = {
     items: toCompactItems(articles),
-    horizonDays
+        horizonDays,
+       // limit が未指定なら選別記事数で送る（上限 500 に安全化）
+       limit: Number.isFinite(limit) ? Math.min(Math.max(1, limit), 500) : Math.min(articles?.length || 0, 500)
   };
 
   const res = await fetch("/api/forecast" , {
@@ -265,10 +282,12 @@ async function runForecast({ articles, horizonDays = 14 }) {
 }
 
 async function runForecast2({ articles, horizonDays = 14 }) {
+
+  console.log("phrases =", articles);
   const payload = {
     items: toCompactItems(articles),
     horizonDays
-  };
+    };
 
   // const res = await fetch("/api/forecast" , {
     const res = await fetch(`${API_BASE}/api/forecast`, {
@@ -276,6 +295,10 @@ async function runForecast2({ articles, horizonDays = 14 }) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload), // ← ここに articles を直接入れない
   });
+
+  console.log("phrases =", res);
+
+
 
   const text = await res.text();            // まず text で受ける（400/502でも読める）
   if (!res.ok) {
@@ -318,14 +341,49 @@ async function selectByAIAndForecast() {
     const json = await res.json();
     if (!res.ok) throw new Error(json?.error || res.status);
 
-    const ids = new Set((json.selected_ids || []).map(String));
-    setLastPhrases(Array.isArray(json.phrases) ? json.phrases : []);
+    // const ids = new Set((json.selected_ids || []).map(String));
+    // setLastPhrases(Array.isArray(json.phrases) ? json.phrases : []);
 
-    // クライアント側 articles から抽出
-    const selected = articles.filter((a, i) => ids.has(getArticleId(a, i)));
+    // // クライアント側 articles から抽出
+    // const selected = articles.filter((a, i) => ids.has(getArticleId(a, i)));
 
-    // Node 版のフォーキャストへ（FastAPIにも切替可）
-    await handleRunForecast({ articles: selected });
+    // // Node 版のフォーキャストへ（FastAPIにも切替可）
+    // await handleRunForecast({ articles: selected });
+
+        const rawPhrases = Array.isArray(json.phrases) ? json.phrases : [];
+    // const phrases = cleanPhrases(rawPhrases);
+    // setLastPhrases(phrases);
+
+    // ① まず「キーワードをタイトルに含む記事」だけに絞る
+    // let selected = articles.filter(a => includesAnyKeywordInTitle(a.title, phrases));
+
+    // ② もし①が0件なら、従来どおり selected_ids で抽出
+  //   if (selected.length === 0) {
+  //     const ids = new Set((json.selected_ids || []).map(String));
+  //     selected = articles.filter((a, i) => ids.has(getArticleId(a, i)));
+  //   }
+
+  //   // ③ それでも空なら最後の保険：全部（現状表示分）
+  //   if (selected.length === 0) selected = articles;
+
+  //   // 送信（Node版フォーキャスト）
+  //  await handleRunForecast({ articles: selected });
+
+   const phrases = cleanPhrases(Array.isArray(json.phrases) ? json.phrases : []);
+ setLastPhrases(phrases);
+
+ 
+ let selected = articles.filter(a => includesAnyKeywordInTitle(a.title, phrases));
+ if (selected.length === 0) { // フォールバック：selected_ids
+  console.log("phrases =", phrases);
+console.log("selected(by title) =", selected.length);
+   const ids = new Set((json.selected_ids || []).map(String));
+   selected = articles.filter((a, i) => ids.has(getArticleId(a, i)));
+ }
+ console.log("phrases =", phrases);
+console.log("selected(by title) =", selected.length);
+ if (selected.length === 0) selected = articles; // 最後の保険
+ await handleRunForecast({ articles: selected, limit: selected.length });
   } catch (e) {
     console.error("selectByAIAndForecast error:", e);
     alert("AI選別に失敗しました: " + String(e?.message || e));
@@ -387,18 +445,32 @@ setAllArticles(list);   // 変更
   };
 
   useEffect(() => { loadAll(); }, []);
- const handleRunForecast = async () => {
-   try {
-     setForecastLoading(true);
-         setForecastSource("node");           // 追加
-     const data = await runForecast({ articles, horizonDays: 14 });
-     setForecast(data);
-   } catch (e) {
-     setForecast({ error: `フォーキャスト生成に失敗: ${String(e?.message || e)}` });
-   } finally {
-     setForecastLoading(false);
-   }
- };
+
+const handleRunForecast = async ({ articles: arts, horizonDays = 14, limit } = {}) => {
+// const handleRunForecast = async ({ articles, horizonDays = 14, limit } = {}) => {
+  try {
+    setForecastLoading(true);
+    setForecastSource("node");
+
+  
+
+        // 引数が無ければ現在の articles を使う
+    const useArticles = Array.isArray(arts) ? arts : (Array.isArray(articles) ? articles : []);
+    if (!useArticles.length) {
+      console.warn("[forecast] no articles to send");
+      setForecast({ error: "フォーキャスト用の記事が0件です（タイトル一致が0件でした）。" });
+      return; // ★ 0件なら送信しない
+    }
+    const effLimit = Number.isFinite(limit) ? Math.max(1, Math.min(limit, 1000)) : useArticles.length;
+   const data = await runForecast({ articles: useArticles, horizonDays, limit: effLimit })
+
+    setForecast(data);
+  } catch (e) {
+    setForecast({ error: `フォーキャスト生成に失敗: ${String(e?.message || e)}` });
+  } finally {
+    setForecastLoading(false);
+  }
+};
 
  const handleRunForecast2 = async () => {
    try {

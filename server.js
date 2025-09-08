@@ -356,67 +356,98 @@ function chunk(arr, n) {
 
 app.post("/api/forecast", async (req, res) => {
   try {
-    const { items = [], horizonDays = 14 } = req.body || {};
+    // const { items = [], horizonDays = 14 } = req.body || {};
+      const { items = [], horizonDays = 14, query = "",limit  } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "items array required" });
     }
 
+        const REQ_LIMIT = Number.isFinite(+limit) ? Math.max(1, Math.min(+limit, 300)) : 120;
+   const MAX_ITEMS = REQ_LIMIT;
+
     // 送信データ（title/summary/source/time + note(ai) を含める）
-    const compact = items.slice(0, 600).map(a => ({
-      title:   a?.title   ?? "",
-      summary: a?.summary ?? "",
-      source:  a?.source  ?? "",
-      time:    a?.time    ?? "",
-      note:    a?.ai ?? a?.note ?? "",   // ★ 重要：noteを同梱
-    }));
-
-    // ===== 1) MAP: チャンク要約（themes & signals のみ）=====
-    const CHUNK_SIZE = 60;
-    const groups = chunk(compact, CHUNK_SIZE);
-
-    const mapPromises = groups.map((group, idx) => {
-      const sys = "Answer in Japanese unless the input is in another language.";
-      const usr =
-        [
-          "You are WORLD FORECAST writer with an astrology lens.",
-  "Always ground every section in the user's natural-language prompt (quoted below).",
-  "Never ignore or replace the user's intent; instead, extract it and explicitly tie each insight back to it.",
-  "",
-  "Rules:",
-  "- Start with a 1–2 sentence \"Prompt Echo\" that paraphrases the user's request using their own key terms.",
-  "- In each section, include at least one explicit reference to a concept from the user's prompt.",
-  "- If the user's prompt mentions zodiac signs/planets/aspects, map them to concrete world themes (e.g., Taurus → resources/energy; Mars → conflict; Mercury → comms/tech).",
-  "- Refuse violent or hateful instructions; otherwise be helpful and neutral.",
-  "",
-  "Self-check before finalizing:",
-  "- Relevance ≥ 0.8: Every section must reference ≥1 term/entity from the user's prompt.",
-  "- Coverage: Address all explicit themes in the user's prompt.",
-  "- Consistency: No contradictions across sections.",
-  "",
-  // 追加指定（日本語優先）
-  "Answer in Japanese unless the input is in another language.",
-   "必ず有効な JSON 形式で返してください（追加のテキストは不要です）。",
-].join("\\n");
-      return callResponses({ model: MODEL_FAST, system: sys, user: usr, temperature: 0.2 })
-        .then(txt => {
-          try { return JSON.parse(txt); }
-          catch { throw new Error(`Chunk#${idx} invalid JSON: ${txt}`); }
-        });
-    });
-
-    const partials = await Promise.all(mapPromises);
-
-    // ===== 2) REDUCE: 最終統合（ホロスコープ＆ガイア理論含む完全JSON）=====
-    const sysFinal = "Answer in Japanese unless the input is in another language.";
-    const usrFinal = [
-      "<USER_PROMPT>",
-      "${USER_PROMPT}",
-      "</USER_PROMPT>",
-      "",
-      "あなたは地政学アナリストです。同時に、西洋占星術のアーキタイプとガイア理論（地球を一つの自己調整システムとみなす仮説）を“比喩”として用いて、ニュースの含意をわかりやすく説明します（断定・占断はしない）。",
-      "Timezone: JST. Horizon: ${horizonDays} days.",
-      "CHUNK_SUMMARIES を統合して、近未来（7〜14日）の世界動向予報を作成してください。",
-      "",
+        // ====== 0) “選別” を forecast にも適用する ======
+        // /api/select_articles と同等：phrases 抽出 + selected_ids 厳選（最大 MAX_ITEMS 件）
+        // const MAX_ITEMS = 120;
+        const condensed = items.slice(0, 500).map((x, i) => ({
+          _idx: i,
+          id: makeId(x, i),
+          title:   x?.title?.slice(0,160) || "",
+          summary: x?.summary?.slice(0,400) || "",
+          source:  x?.source || "",
+          time:    x?.time || "",
+          note:    (x?.ai ?? x?.note ?? "")
+      }));
+    
+        // モデル呼び出し（選別用）
+        let phrases = [];
+  　    let selected_ids = [];
+        if (typeof query === "string" && query.trim()) {
+          const selSys = `あなたはニュース選別のアナリストです。与えられた自然言語クエリに対し、
+    - 解析に本質的に必要な「短いフレーズ」を3〜8個抽出（日本語/英語混在可）
+    - そのフレーズで説明可能なカードだけを選び、最大 ${MAX_ITEMS} 件に厳選
+    厳選の基準: タイトル/要約/ソース/時刻がクエリの意図に明確に関係すること。
+    出力は厳密なJSONのみ: { "phrases": string[], "selected_ids": string[], "rationale": string }`;
+          const selUsr = JSON.stringify({ query, items: condensed.map(({_idx, ...rest}) => rest) });
+          try {
+            const txt = await callResponses({
+              model: "gpt-4o-mini",
+              system: selSys,
+              user: selUsr,
+              temperature: 0.2,
+              format: "json",
+            });
+            const out = JSON.parse(txt || "{}");
+            if (Array.isArray(out?.phrases))      phrases = out.phrases.slice(0, 16);
+            if (Array.isArray(out?.selected_ids)) selected_ids = out.selected_ids.map(String).slice(0, MAX_ITEMS);
+          } catch (_) { /* fall through */ }
+    
+          // フォールバック（簡易キーワード一致）
+          if (!selected_ids.length) {
+            const q = query.toLowerCase();
+            const tokens = (q.match(/"[^"]+"|[^\s]+/g) || []).map(t => t.replace(/"/g, "").toLowerCase());
+            const scored = condensed.map(it => {
+              const text = `${it.title} ${it.summary} ${it.source} ${it.note}`.toLowerCase();
+              const score = tokens.reduce((a, t) => a + (t && text.includes(t) ? 1 : 0), 0);
+              return { id: it.id, score, _idx: it._idx };
+            }).sort((a,b) => b.score - a.score)
+              .filter(x => x.score > 0)
+              .slice(0, MAX_ITEMS);
+            selected_ids = scored.map(s => s.id);
+            if (!phrases.length) phrases = tokens.slice(0, 10);
+         }
+        }
+    
+        // 最終的に forecast に渡す “厳選 items”
+        let filtered = items;
+        if (selected_ids.length) {
+          const idSet = new Set(selected_ids);
+          filtered = items.filter((x, i) => idSet.has(makeId(x, i)));
+        }
+      // 念のため上限
+       if (filtered.length > MAX_ITEMS) filtered = filtered.slice(0, MAX_ITEMS);
+    
+        // 送信データ（title/summary/source/time + note(ai) を含める）
+        const compact = filtered.map(a => ({
+        title:   a?.title   ?? "",
+        summary: a?.summary ?? "",
+          source:  a?.source  ?? "",
+         time:    a?.time    ?? "",
+         note:    a?.ai ?? a?.note ?? "",
+        }));
+    
+        // 全量ではなく厳選記事のみを要約
+       const CHUNK_SIZE = Math.max(20, Math.ceil(MAX_ITEMS / 10)); // 目安：最大10チャンク         const groups = chunk(compact, CHUNK_SIZE);
+    
+        const sysFinal = "Answer in Japanese unless the input is in another language.";
+         const usrFinal = [
+           "あなたは地政学アナリストです。同時に、西洋占星術のアーキタイプとガイア理論（地球を一つの自己調整システムとみなす仮説）を“比喩”として用いて、ニュースの含意をわかりやすく説明します（断定・占断はしない）。",
+           `Timezone: JST. Horizon: ${horizonDays} days.`,
+           "CHUNK_SUMMARIES を統合して、近未来（7〜14日）の世界動向予報を作成してください。",
+          `COVERAGE_CAP: ${MAX_ITEMS}`,
+        `COVERAGE_COUNT: ${compact.length}`,
+         `SELECT_PHRASES: ${JSON.stringify(phrases || [])}`,
+          `SELECT_PHRASES: ${JSON.stringify(phrases || [])}`,
       "出力は次のキーを持つ単一の JSON オブジェクトとします：",
       "as_of_jst (string),",
       "coverage_count (int),",

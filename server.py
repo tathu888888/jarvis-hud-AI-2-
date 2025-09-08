@@ -37,6 +37,8 @@ app.add_middleware(
 )
 
 
+
+
 # 直近の items をキャッシュ（/api/forecast 呼び出し時に更新）
 
 
@@ -55,6 +57,18 @@ class Item(BaseModel):
 class ForecastReq(BaseModel):
     items: List[Item]
     horizonDays: int = Field(default=14, ge=1, le=30)
+    limit: Optional[int] = None  # ← 受け取るだけで未使用
+    class Config:
+        extra = "ignore"   # ★ これで limit を無視
+
+
+class Item(BaseModel):
+    title: Optional[str] = ""
+    summary: Optional[str] = ""
+    source: Optional[str] = ""
+    time: Optional[str] = ""      # ISO文字列想定
+    note: Optional[str] = ""
+
 
 # ---------- Helpers ----------
 JST = pytz.timezone("Asia/Tokyo")
